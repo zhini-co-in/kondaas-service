@@ -1,15 +1,22 @@
 import { Hono } from 'hono';
 
-import { addLocation, getLocationByTime, getCurrentLocation,getInstallerDealsByMobile,notifyInstallerETA } from '../controllers/installerController.js';
+import { addLocation,triggerInstallationNotification,rejectInstallation,addInstallationNote,installationCheckIn,updateInstallationDetails,updateInstallationStatus,getInstallerInstallations,installationWebhook,getLocationByTime, getCurrentLocation } from '../controllers/installerController.js';
 
 const installerRoutes = new Hono();
 
 installerRoutes.post('/add', addLocation);
+installerRoutes.post('/notes', addInstallationNote);
+installerRoutes.post('/notification', triggerInstallationNotification);
+installerRoutes.post('/reject', rejectInstallation);
+installerRoutes.post('/check-in', installationCheckIn);
+
+installerRoutes.put('/form', updateInstallationDetails);
+
 installerRoutes.post('/bytime', getLocationByTime);
 installerRoutes.post('/current', getCurrentLocation);
+installerRoutes.put('/status', updateInstallationStatus);
 
-installerRoutes.get('/deals', getInstallerDealsByMobile);
+installerRoutes.post('/assign', installationWebhook);
 
-installerRoutes.post('/delivery', notifyInstallerETA);
-
+installerRoutes.get('/installations', getInstallerInstallations);
 export default installerRoutes;

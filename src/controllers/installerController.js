@@ -1,5 +1,6 @@
-import { withDatabase } from '../utils/config.js'; 
-import admin from "firebase-admin";
+import { withDatabase,Binary } from '../utils/config.js';
+import { getZohoAccessToken } from '../utils/zohoAuth.js';
+import { processWhatsAppNotification } from './notificationController.js';
 
 const MONGODB_URI = process.env.MONGODB_URI;
 
@@ -126,100 +127,997 @@ export const getCurrentLocation = async (c) => {
 };
 
 
-export const getInstallerDealsByMobile = async (c) => {
+export const installationWebhook = async (c) => {
   try {
-    // 1. Grab the mobile number from the query string parameters (e.g., ?mobile=6666666666)
-    const mobile = c.req.query("mobile");
+    // 1. Parse incoming payload (handles JSON, urlencoded, or multipart)
+    const contentType = c.req.header("content-type") || "";
+    let payload = {};
 
-    if (!mobile) {
-      return c.json({ success: false, error: "Missing mobile query parameter" }, 400);
+    if (contentType.includes("application/json")) {
+      payload = await c.req.json();
+    } else if (
+      contentType.includes("application/x-www-form-urlencoded") ||
+      contentType.includes("multipart/form-data")
+    ) {
+      payload = await c.req.parseBody();
+    } else {
+      try {
+        payload = await c.req.json();
+      } catch {
+        payload = await c.req.parseBody();
+      }
     }
 
-    return await withDatabase(MONGODB_URI, async (db) => {
-      // 2. Fetch all assignments matching this mobile number
-      const deals = await db
-        .collection("Installer_deals")
-        .find({ mobile: mobile })
-        .sort({ assignedAt: -1 }) // ✨ Newest runs appear at the top of their screen
-        .toArray();
+    // Fail-safe: Unpack bundled query parameters if Zoho passed them inside 'id'
+    let rawId = payload.id || payload.record_id || "";
+    if (typeof rawId === "string" && rawId.includes("&")) {
+      const parts = rawId.split("&");
+      rawId = parts[0]; // Actual Zoho Record ID (e.g. 923194000015057014)
 
-      // 3. Return the array to populate the app's list view
+      // Extract trailing key-values into payload if not already present
+      for (let i = 1; i < parts.length; i++) {
+        const [paramKey, paramVal] = parts[i].split("=");
+        if (paramKey && !payload[paramKey]) {
+          payload[paramKey] = decodeURIComponent(paramVal || "");
+        }
+      }
+    }
+
+    // 2. Extract incoming fields
+    const {
+      installerNumber,
+      installerMobile,
+      customerName,
+      customerPhone,
+      customerMobile,
+      street,
+      city,
+      planned,
+      installationId,
+      province,
+      postalCode,
+      country,
+      latitude,
+      longitude,
+      // Product & Material details
+      inverterModel,
+      inverterCapacity,
+      inverterConnectionType,
+      inverterBrand,
+      solarPanelType,
+      solarPanelBrand,
+      noOfPanels,
+      cableRequirements,
+      installerHomeLocation,
+      installerOfficeLocation,
+      earthingCable,
+      additionalMaterialReq,
+      requiredAdditionalMaterial,
+      additionalMaterialCost
+    } = payload;
+
+    const zohoId = rawId;
+    if (!zohoId) {
+      console.warn("⚠️ Installation Webhook received without an ID:", payload);
+      return c.json({ error: "Missing record ID from Zoho" }, 400);
+    }
+
+    // Helper: clean & normalize phone numbers to standard 10 digits
+    const normalizePhoneNumber = (number) => {
+      if (!number) return null;
+      let digits = String(number).replace(/\D/g, "");
+      if (digits.length === 12 && digits.startsWith("91")) {
+        digits = digits.substring(2);
+      }
+      return digits || null;
+    };
+
+    // 3. Resolve and normalize phone numbers
+    const rawInstallerPhone = installerMobile || installerNumber || "";
+    const assignedTo = normalizePhoneNumber(rawInstallerPhone);
+
+    const rawCustomerPhone = customerMobile || customerPhone || "";
+    const normalizedCustomerPhone = normalizePhoneNumber(rawCustomerPhone);
+
+    // 4. Construct installation document
+    const installationData = {
+      zohoId: String(zohoId),
+      installationId: installationId || null,
+      planned: planned || null,
+      assignedTo: assignedTo || null,
+      installerMobile: installerMobile || null,
+      installerNumber: installerNumber || null,
+      customerName: customerName || null,
+      customerPhone: normalizedCustomerPhone,
+      customerRawPhone: customerPhone || null,
+      customerRawMobile: customerMobile || null,
+      location: {
+        latitude: latitude ? parseFloat(latitude) || latitude : null,
+        longitude: longitude ? parseFloat(longitude) || longitude : null
+      },
+      address: {
+        street: street || null,
+        city: city || null,
+        province: province || null,
+        postalCode: postalCode || null,
+        country: country || null
+      },
+      productInformation: {
+        inverterModel: inverterModel || null,
+        inverterCapacity: inverterCapacity || null,
+        inverterConnectionType: inverterConnectionType || null,
+        inverterBrand: inverterBrand || null,
+        solarPanelType: solarPanelType || null,
+        solarPanelBrand: solarPanelBrand || null,
+        noOfPanels: noOfPanels || null,
+        cableRequirements: cableRequirements || null,
+        installerHomeLocation: installerHomeLocation || null,
+        installerOfficeLocation: installerOfficeLocation || null,
+        earthingCable: earthingCable || null,
+        additionalMaterialReq: additionalMaterialReq || null,
+        requiredAdditionalMaterial: requiredAdditionalMaterial || null,
+        additionalMaterialCost: additionalMaterialCost || null
+      },
+      status: "assigned",
+      updatedAt: new Date()
+    };
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      // 5. Upsert into the 'installation' collection
+      await db.collection("installation").updateOne(
+        { zohoId: String(zohoId) },
+        {
+          $set: installationData,
+          $setOnInsert: { createdAt: new Date() }
+        },
+        { upsert: true }
+      );
+
+      console.log(`✅ Installation record synced: ${zohoId} assigned to ${assignedTo}`);
+
       return c.json({
         success: true,
-        count: deals.length,
-        data: deals
-      }, 200);
+        message: "Installation record synced successfully",
+        zohoId,
+        assignedTo
+      });
     });
-
   } catch (err) {
-    console.error("❌ Fetching Logistics Deals Exception:", err.message);
-    return c.json({ success: false, error: "Failed to retrieve logistics assignments" }, 500);
+    console.error("❌ Installation Webhook Error Exception:", err.message);
+    return c.json({ error: "Internal server error", details: err.message }, 500);
   }
 };
 
 
-export const notifyInstallerETA = async (c) => {
+export const getInstallerInstallations = async (c) => {
+  try {
+    // 1. Grab query params from the incoming request
+    const query = c.req.query();
+    let installerNumber = query.installerNumber || query.installerMobile;
+
+    if (!installerNumber) {
+      return c.json({ error: "Missing installer identity verification parameter" }, 400);
+    }
+
+    // Normalize phone number to 10 digits to match the assignedTo storage format
+    installerNumber = String(installerNumber).replace(/\D/g, "");
+    if (installerNumber.length === 12 && installerNumber.startsWith("91")) {
+      installerNumber = installerNumber.substring(2);
+    }
+
+    // 2. Parse and sanitize pagination parameters
+    const page = Math.max(1, parseInt(query.page || "1", 10));
+    const limit = Math.max(1, Math.min(100, parseInt(query.limit || "10", 10)));
+    const skip = (page - 1) * limit;
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      const filter = { assignedTo: installerNumber };
+
+      // 3. Run query and total count concurrently for performance
+      const [assignedInstallations, totalInstallations] = await Promise.all([
+        db.collection("installation")
+          .find(filter)
+          .sort({ createdAt: -1 }) // Newest jobs first
+          .skip(skip)
+          .limit(limit)
+          .toArray(),
+        db.collection("installation").countDocuments(filter)
+      ]);
+
+      const totalPages = Math.ceil(totalInstallations / limit);
+      const hasMore = page < totalPages;
+
+      console.log(
+        `📱 Installer Workspace [${installerNumber}] - Page ${page}/${totalPages || 1} loaded. Sent ${assignedInstallations.length} tasks (Total: ${totalInstallations}).`
+      );
+
+      // 4. Return installation jobs along with FlatList-ready pagination metadata
+      return c.json(
+        {
+          success: true,
+          installations: assignedInstallations,
+          pagination: {
+            total: totalInstallations,
+            page,
+            limit,
+            totalPages,
+            hasMore
+          }
+        },
+        200
+      );
+    });
+  } catch (err) {
+    console.error("❌ Fetch Installer Dashboard Exception:", err.message);
+    return c.json({ error: "Failed to pull installer task workspace" }, 500);
+  }
+};
+
+
+export const updateInstallationStatus = async (c) => {
   try {
     const body = await c.req.json();
-    const { logisticMemberNumber, installerNumber, eta } = body;
+    const { id, status } = body;
 
-    // Fast validation check
-    if (!installerNumber || !eta) {
-      return c.json({ error: "Missing required fields: installerNumber or eta" }, 400);
+    // 1. Parameter Validation
+    if (!id || !status) {
+      return c.json(
+        { error: "Validation Error: Missing required fields 'id' or 'status'." },
+        400
+      );
+    }
+
+    // Standardize input string for robust comparison matching
+    const normalizedStatus = status.toLowerCase().trim().replace(/[\s_-]+/g, "");
+
+    // 2. Exact Mapping to Zoho's case-sensitive dropdown configurations
+    let zohoValue = null;
+    let localCleanedStatus = null;
+
+    if (normalizedStatus === "installationassigned" || normalizedStatus === "assigned") {
+      zohoValue = "Installation Assigned";
+      localCleanedStatus = "Installation Assigned";
+    } else if (
+      normalizedStatus === "engineerreachessite" ||
+      normalizedStatus === "reachedsite" ||
+      normalizedStatus === "reached"
+    ) {
+      zohoValue = "Engineer Reaches Site";
+      localCleanedStatus = "Engineer Reaches Site";
+    } else if (
+      normalizedStatus === "materialverification" ||
+      normalizedStatus === "verified"
+    ) {
+      zohoValue = "Material Verification";
+      localCleanedStatus = "Material Verification";
+    } else if (normalizedStatus === "installationstart" || normalizedStatus === "start") {
+      zohoValue = "Installation Start";
+      localCleanedStatus = "Installation Start";
+    } else if (
+      normalizedStatus === "installationprogress" ||
+      normalizedStatus === "inprogress" ||
+      normalizedStatus === "progress"
+    ) {
+      zohoValue = "Installation Progress";
+      localCleanedStatus = "Installation Progress";
+    } else if (
+      normalizedStatus === "accepted" ||
+      normalizedStatus === "Accepted"
+    ) {
+      zohoValue = "Accepted";
+      localCleanedStatus = "Accepted";
+    } else if (
+      normalizedStatus === "installationcompleted" ||
+      normalizedStatus === "completed"
+    ) {
+      zohoValue = "Installation Completed";
+      localCleanedStatus = "Installation Completed";
+    }
+
+    // Fallback if the requested value doesn't match available options
+    if (!zohoValue) {
+      return c.json(
+        {
+          error: `Validation Error: '${status}' is not recognized. Must be one of: Installation Assigned, Engineer Reaches Site, Material Verification, Installation Start, Installation Progress, Installation Completed`
+        },
+        400
+      );
     }
 
     return await withDatabase(MONGODB_URI, async (db) => {
-      
-      // 1. Look up the targeted installer's profile to fetch their active device tokens
-      const installerProfile = await db.collection("userDetails").findOne({
-        "UserInfo.phoneNo": installerNumber,
-        "UserInfo.role": "installer"
+      // 🔐 Grab active authorization credentials dynamically
+      const zohoToken = await getZohoAccessToken(db);
+
+      // 3. Build the precise Zoho payload
+      const zohoPayload = {
+        data: [
+          {
+            id: String(id),
+            Installation_Status: zohoValue
+          }
+        ]
+      };
+
+      console.log(
+        `📡 Transmitting Targeted Dropdown Update to Zoho CRM Installation for record ID: ${id} -> Value: ${zohoValue}...`
+      );
+
+      // 4. Update Remote Zoho CRM
+      const response = await fetch(`https://www.zohoapis.in/crm/v8/Installation/${id}`, {
+        method: "PUT",
+        headers: {
+          Authorization: `Zoho-oauthtoken ${zohoToken}`,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify(zohoPayload)
       });
 
-      if (!installerProfile) {
-        console.log(`⚠️ Installer profile not found for phone number: ${installerNumber}`);
-        return c.json({ error: "Target installer profile not found" }, 404);
+      if (!response.ok) {
+        const errTxt = await response.text();
+        console.error("❌ Zoho Dropdown Update execution failed:", errTxt);
+        return c.json(
+          { error: "Failed to update record state on Zoho.", details: errTxt },
+          500
+        );
       }
 
-      // 2. Extract tokens from the installer's devices array
-      let installerTokens = [];
-      const devices = installerProfile.PlatformInfo?.devices;
-      if (devices && Array.isArray(devices)) {
-        devices.forEach((device) => {
-          if (device.fcmToken) {
-            installerTokens.push(device.fcmToken);
+      const result = await response.json();
+      console.log("✅ Zoho Server Response Status Payload:", JSON.stringify(result));
+
+      // 5. 🔄 UNIFIED STEP: Sync straight to local MongoDB "installation" collection
+      console.log(
+        `🔄 Syncing local status for Installation [${id}] to matching state: ${localCleanedStatus}`
+      );
+
+      const localResult = await db.collection("installation").updateOne(
+        { zohoId: String(id) },
+        {
+          $set: {
+            status: localCleanedStatus,
+            updatedAt: new Date()
           }
-        });
+        }
+      );
+
+      if (localResult.matchedCount === 0) {
+        console.warn(
+          `⚠️ Remote Zoho target updated, but no matching local record tracked for Installation ID: ${id}`
+        );
+      } else {
+        console.log(
+          `✅ Successfully shifted status locally for Installation [${id}] to: ${localCleanedStatus}`
+        );
       }
 
-      // 3. Send standard push notification to this specific installer
-      if (installerTokens.length > 0) {
-        const message = {
-          notification: {
-            title: "Delivery Coming Your Way! 🚚",
-            body: `Logistics member (${logisticMemberNumber || 'Team'}) is arriving. ETA: ${eta}.`,
-          },
-          data: {
-            click_action: "FLUTTER_NOTIFICATION_CLICK",
-            type: "DELIVERY_ETA"
-          },
-          tokens: installerTokens,
+      return c.json({
+        success: true,
+        message: `Installation Status successfully transitioned to '${zohoValue}' inside both Zoho and local database.`,
+        id: id,
+        currentLocalStatus: localCleanedStatus
+      });
+    });
+  } catch (err) {
+    console.error("❌ Dropdown Update Exception Error:", err.message);
+    return c.json({ error: "Internal server error" }, 500);
+  }
+};
+
+export const updateInstallationDetails = async (c) => {
+  try {
+    const contentType = c.req.header("content-type") || "";
+    let id = null;
+    const fieldsToUpdate = {};
+    const photoUploads = [];
+
+    // Helper to detect multipart binary files
+    const isFileObject = (val) => {
+      if (!val) return false;
+      return (
+        val instanceof File ||
+        (typeof val === "object" && typeof val.arrayBuffer === "function") ||
+        (typeof val === "object" && val.name && val.type && typeof val.size === "number")
+      );
+    };
+
+    // 1. Parse incoming Multipart or JSON
+    if (contentType.includes("multipart/form-data")) {
+      const body = await c.req.parseBody({ all: true });
+      id = body.id;
+
+      for (const [key, val] of Object.entries(body)) {
+        if (key === "id") continue;
+
+        const values = Array.isArray(val) ? val : [val];
+        const files = values.filter(isFileObject);
+
+        if (files.length > 0) {
+          files.forEach((file) => {
+            photoUploads.push({ fieldApiName: key, file });
+          });
+        } else {
+          const rawVal = Array.isArray(val) ? val[0] : val;
+          if (key === "fields" || key === "data") {
+            try {
+              Object.assign(fieldsToUpdate, JSON.parse(rawVal));
+            } catch {
+              fieldsToUpdate[key] = rawVal;
+            }
+          } else {
+            fieldsToUpdate[key] = rawVal;
+          }
+        }
+      }
+    } else {
+      const body = await c.req.json();
+      id = body.id;
+      const { fields, ...rest } = body;
+      Object.assign(fieldsToUpdate, fields ? fields : rest);
+    }
+
+    if (!id) {
+      return c.json({ error: "Validation Error: Missing required 'id' (Zoho Installation ID)." }, 400);
+    }
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      const zohoToken = await getZohoAccessToken(db);
+      const zohoHeaders = {
+        Authorization: `Zoho-oauthtoken ${zohoToken}`
+      };
+
+      const uploadedImages = [];
+
+      // 2. Upload each photo to Zoho Files API (ZFS)
+      for (const item of photoUploads) {
+        const arrayBuffer = await item.file.arrayBuffer();
+        const fileBlob = new Blob([arrayBuffer], { type: item.file.type || "image/jpeg" });
+
+        const fileFormData = new FormData();
+        fileFormData.append("file", fileBlob, item.file.name || `${item.fieldApiName}.jpg`);
+
+        const fileUploadRes = await fetch("https://www.zohoapis.in/crm/v8/files", {
+          method: "POST",
+          headers: zohoHeaders,
+          body: fileFormData
+        });
+
+        if (fileUploadRes.ok) {
+          const fileResJson = await fileUploadRes.json();
+          const fileId = fileResJson.data?.[0]?.details?.id;
+
+          if (fileId) {
+            fieldsToUpdate[item.fieldApiName] = [
+              {
+                File_Id__s: fileId
+              }
+            ];
+
+            uploadedImages.push({
+              field: item.fieldApiName,
+              fileId: fileId,
+              fileName: item.file.name
+            });
+          } else {
+            console.warn(`⚠️ No file ID returned for ${item.fieldApiName}:`, fileResJson);
+          }
+        } else {
+          const fileErr = await fileUploadRes.text();
+          console.error(`❌ Zoho Files API Upload Failed for ${item.fieldApiName}:`, fileErr);
+        }
+      }
+
+      // 3. Update the Zoho CRM Record with text fields and mapped file_ids
+      if (Object.keys(fieldsToUpdate).length > 0) {
+        const payloadData = {
+          data: [
+            {
+              id: String(id),
+              ...fieldsToUpdate
+            }
+          ]
         };
 
-        const response = await admin.messaging().sendEachForMulticast(message);
-        console.log(`🚀 ETA push alert sent to installer (${installerNumber}). Success count: ${response.successCount}`);
-      } else {
-        console.log(`⚠️ Installer found, but no active FCM tokens registered for phone: ${installerNumber}`);
+        const updateRes = await fetch(`https://www.zohoapis.in/crm/v8/Installation/${id}`, {
+          method: "PUT",
+          headers: {
+            ...zohoHeaders,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify(payloadData)
+        });
+
+        const updateJson = await updateRes.json();
+
+        if (!updateRes.ok || updateJson.data?.[0]?.status === "error") {
+          console.error("📡 Sent Payload to Zoho was:\n", JSON.stringify(payloadData, null, 2));
+          console.error("❌ Full Zoho Error Details:\n", JSON.stringify(updateJson, null, 2));
+          return c.json({ error: "Failed to update record fields on Zoho CRM", details: updateJson }, 500);
+        }
       }
 
-      return c.json({ 
-        success: true, 
-        message: "Installer successfully notified of incoming logistics arrival." 
+      const timestamp = new Date();
+
+      // 4. Update MongoDB Document Locally
+      const mongoSetUpdates = {
+        updatedAt: timestamp
+      };
+
+      for (const [k, v] of Object.entries(fieldsToUpdate)) {
+        mongoSetUpdates[`zohoFields.${k}`] = v;
+      }
+
+      if (fieldsToUpdate.Status || fieldsToUpdate.Installation_Status) {
+        mongoSetUpdates.status = fieldsToUpdate.Status || fieldsToUpdate.Installation_Status;
+      }
+
+      const mongoUpdateQuery = {
+        $set: mongoSetUpdates
+      };
+
+      if (uploadedImages.length > 0) {
+        mongoUpdateQuery.$push = {
+          uploadedPhotos: { $each: uploadedImages }
+        };
+      }
+
+      // 5. Concurrently sync 'installation' and log to 'installation-forms'
+      await Promise.all([
+        db.collection("installation").updateOne(
+          { zohoId: String(id) },
+          mongoUpdateQuery
+        ),
+        db.collection("installation-forms").insertOne({
+          installationId: String(id),
+          zohoId: String(id),
+          formData: fieldsToUpdate,
+          uploadedPhotos: uploadedImages,
+          submittedAt: timestamp,
+          createdAt: timestamp
+        })
+      ]);
+
+      return c.json({
+        success: true,
+        message: "Installation fields, photos, and form records processed successfully",
+        id,
+        updatedFields: fieldsToUpdate,
+        photosUploaded: uploadedImages
       }, 200);
     });
 
   } catch (err) {
-    console.error("❌ NotifyInstallerETA Endpoint Error:", err.message);
-    return c.json({ error: "Internal server error during ETA alert delivery" }, 500);
+    console.error("❌ Update Installation Details Exception:", err.message);
+    return c.json({ error: "Internal server error", details: err.message }, 500);
+  }
+};
+
+// Notes section on Installation on Zoho CRM
+export const addInstallationNote = async (c) => {
+  try {
+    const { installation_id, content, title } = await c.req.json();
+
+    // 1. Validation
+    if (!installation_id) {
+      return c.json({ error: "Missing required parameter: 'installation_id'" }, 400);
+    }
+
+    if (!content || !String(content).trim()) {
+      return c.json({ error: "Missing required parameter: 'content'" }, 400);
+    }
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      // 2. Retrieve Zoho Access Token
+      const zohoToken = await getZohoAccessToken(db);
+
+      // 3. Prepare Note Payload for Zoho CRM
+      const notePayload = {
+        Note_Title: title ? String(title).trim() : "Installation Note",
+        Note_Content: String(content).trim()
+      };
+
+      // 4. Attach Note to Installation via Related List Endpoint
+      const zohoResponse = await fetch(
+        `https://www.zohoapis.in/crm/v8/Installation/${installation_id}/Notes`,
+        {
+          method: "POST",
+          headers: {
+            Authorization: `Zoho-oauthtoken ${zohoToken}`,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ data: [notePayload] })
+        }
+      );
+
+      const result = await zohoResponse.json();
+
+      if (!zohoResponse.ok || (result.data && result.data[0]?.status === "error")) {
+        console.error("❌ Zoho CRM Note creation error:", JSON.stringify(result, null, 2));
+        return c.json(
+          {
+            error: "Failed to create note in Zoho CRM",
+            details: result
+          },
+          zohoResponse.status >= 400 ? zohoResponse.status : 500
+        );
+      }
+
+      const noteDetails = result.data?.[0]?.details || {};
+      const noteRecord = {
+        noteId: noteDetails.id || null,
+        title: notePayload.Note_Title,
+        content: notePayload.Note_Content,
+        createdAt: new Date()
+      };
+
+      // 5. Audit the note locally in MongoDB
+      await db.collection("installation").updateOne(
+        { zohoId: String(installation_id) },
+        {
+          $push: { notes: noteRecord },
+          $set: { updatedAt: new Date() }
+        }
+      );
+
+      return c.json({
+        success: true,
+        message: "Note added to installation successfully",
+        installation_id,
+        note: noteRecord,
+        zohoResult: result.data?.[0] || result
+      });
+    });
+  } catch (error) {
+    console.error("❌ Error in addInstallationNote handler:", error.message);
+    return c.json({ error: "Internal Server Error", details: error.message }, 500);
+  }
+};
+
+
+export const installationCheckIn = async (c) => {
+  try {
+    const contentType = c.req.header("content-type") || "";
+    let id = null;
+    let latitude = null;
+    let longitude = null;
+    let checkInTime = null;
+    let photoFile = null;
+
+    // Helper: checks whether an incoming value is a file/binary upload
+    const isFileObject = (val) => {
+      if (!val) return false;
+      return (
+        val instanceof File ||
+        (typeof val === "object" && typeof val.arrayBuffer === "function") ||
+        (typeof val === "object" && val.name && val.type && typeof val.size === "number")
+      );
+    };
+
+    // 1. Parse Multipart (FormData)
+    if (contentType.includes("multipart/form-data")) {
+      const body = await c.req.parseBody({ all: true });
+      id = body.id;
+      latitude = body.Check_in_Latitude || body.latitude;
+      longitude = body.Check_in_Longitude || body.longitude;
+      checkInTime = body.Engineer_Check_in_Time || body.checkInTime;
+
+      // Extract the photo file (matches 'Engineer_Check_in_Photo' or any passed binary file)
+      for (const [key, val] of Object.entries(body)) {
+        const fileObj = Array.isArray(val) ? val[0] : val;
+        if (isFileObject(fileObj)) {
+          photoFile = fileObj;
+          break;
+        }
+      }
+    } else {
+      const body = await c.req.json();
+      id = body.id;
+      latitude = body.Check_in_Latitude || body.latitude;
+      longitude = body.Check_in_Longitude || body.longitude;
+      checkInTime = body.Engineer_Check_in_Time || body.checkInTime;
+    }
+
+    if (!id) {
+      return c.json({ error: "Validation Error: Missing required 'id' (Zoho Installation ID)." }, 400);
+    }
+
+    const currentTimestamp = new Date();
+    // Default to ISO 8601 string if mobile did not explicitly provide check-in time
+    const formattedCheckInTime = checkInTime || currentTimestamp.toISOString();
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      const zohoToken = await getZohoAccessToken(db);
+      const zohoHeaders = {
+        Authorization: `Zoho-oauthtoken ${zohoToken}`
+      };
+
+      const fieldsToUpdate = {
+        Engineer_Check_in_Time: formattedCheckInTime
+      };
+
+      if (latitude !== undefined && latitude !== null) {
+        fieldsToUpdate.Check_in_Latitude = String(latitude);
+      }
+      if (longitude !== undefined && longitude !== null) {
+        fieldsToUpdate.Check_in_Longitude = String(longitude);
+      }
+
+      let uploadedPhotoId = null;
+
+      // 2. Upload photo to Zoho Files API (ZFS) if provided
+      if (photoFile) {
+        const arrayBuffer = await photoFile.arrayBuffer();
+        const fileBlob = new Blob([arrayBuffer], { type: photoFile.type || "image/jpeg" });
+
+        const fileFormData = new FormData();
+        fileFormData.append("file", fileBlob, photoFile.name || "Engineer_Check_in_Photo.jpg");
+
+        const fileUploadRes = await fetch("https://www.zohoapis.in/crm/v8/files", {
+          method: "POST",
+          headers: zohoHeaders,
+          body: fileFormData
+        });
+
+        if (fileUploadRes.ok) {
+          const fileResJson = await fileUploadRes.json();
+          uploadedPhotoId = fileResJson.data?.[0]?.details?.id;
+
+          if (uploadedPhotoId) {
+            // Bind using Zoho v8 File_Id__s standard
+            fieldsToUpdate.Engineer_Check_in_Photo = [
+              {
+                File_Id__s: uploadedPhotoId
+              }
+            ];
+          } else {
+            console.warn("⚠️ No file ID returned for Engineer_Check_in_Photo:", fileResJson);
+          }
+        } else {
+          const fileErr = await fileUploadRes.text();
+          console.error("❌ Zoho Files API Upload Failed for Engineer_Check_in_Photo:", fileErr);
+        }
+      }
+
+      // 3. Update the Installation record on Zoho CRM
+      const updateRes = await fetch(`https://www.zohoapis.in/crm/v8/Installation/${id}`, {
+        method: "PUT",
+        headers: {
+          ...zohoHeaders,
+          "Content-Type": "application/json"
+        },
+        body: JSON.stringify({
+          data: [
+            {
+              id: String(id),
+              ...fieldsToUpdate
+            }
+          ]
+        })
+      });
+
+      const updateJson = await updateRes.json();
+
+      if (!updateRes.ok || updateJson.data?.[0]?.status === "error") {
+        console.error(`❌ Zoho Installation check-in rejected for [${id}]:`, updateJson);
+        
+        console.error("📡 Sent Payload was:", JSON.stringify(fieldsToUpdate, null, 2));
+        console.error("❌ Full Zoho Error Details:", JSON.stringify(updateJson, null, 2));
+        return c.json({ error: "Failed to record check-in on Zoho CRM", details: updateJson }, 500);
+      }
+
+      // 4. Update MongoDB Document Locally
+      const checkInRecord = {
+        checkInTime: new Date(formattedCheckInTime),
+        latitude: latitude ? parseFloat(latitude) : null,
+        longitude: longitude ? parseFloat(longitude) : null,
+        photoFileId: uploadedPhotoId || null,
+        submittedAt: currentTimestamp
+      };
+
+      await db.collection("installation").updateOne(
+        { zohoId: String(id) },
+        {
+          $set: {
+            checkIn: checkInRecord,
+            status: "Engineer Checked-in",
+            updatedAt: currentTimestamp
+          }
+        }
+      );
+
+      return c.json({
+        success: true,
+        message: "Engineer check-in recorded successfully",
+        id,
+        checkIn: checkInRecord
+      }, 200);
+    });
+
+  } catch (err) {
+    console.error("❌ Installation Check-In Exception:", err.message);
+    return c.json({ error: "Internal server error", details: err.message }, 500);
+  }
+};
+
+
+export const rejectInstallation = async (c) => {
+  try {
+    const body = await c.req.json();
+    const { id, installationId, installerMobile, reason, remarks } = body;
+
+    const rawId = id || installationId;
+
+    if (!rawId) {
+      return c.json({ error: "Missing required parameter: 'id' or 'installationId'" }, 400);
+    }
+
+    if (!reason || !String(reason).trim()) {
+      return c.json({ error: "Missing required parameter: 'reason'" }, 400);
+    }
+
+    const timestamp = new Date();
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      // 1. Locate the installation document
+      const existingDoc = await db.collection("installation").findOne({
+        $or: [
+          { zohoId: String(rawId) },
+          { installationId: String(rawId) }
+        ]
+      });
+
+      if (!existingDoc) {
+        return c.json({ error: `Installation record not found for '${rawId}'` }, 404);
+      }
+
+      const zohoId = existingDoc.zohoId;
+      const resolvedInstallationId = existingDoc.installationId || rawId;
+      const rejectingInstaller = installerMobile || existingDoc.assignedTo || null;
+
+      // 2. Insert detailed record into 'installation-rejections'
+      const rejectionDoc = {
+        installationObjectId: existingDoc._id,
+        zohoId: String(zohoId),
+        installationId: resolvedInstallationId,
+        rejectedBy: rejectingInstaller,
+        reason: String(reason).trim(),
+        remarks: remarks ? String(remarks).trim() : null,
+        rejectedAt: timestamp,
+        createdAt: timestamp
+      };
+
+      const rejectionInsert = await db.collection("installation-rejections").insertOne(rejectionDoc);
+
+      // 3. Update 'installation' by pushing ONLY the generated ObjectId reference
+      await db.collection("installation").updateOne(
+        { _id: existingDoc._id },
+        {
+          $set: {
+            status: "Installation Rejected",
+            assignedTo: null,
+            installerMobile: null,
+            installerNumber: null,
+            updatedAt: timestamp
+          },
+          $push: {
+            rejectionIds: rejectionInsert.insertedId // Just the ObjectId reference
+          }
+        }
+      );
+
+      return c.json({
+        success: true,
+        message: "Installation marked as rejected and unassigned successfully",
+        zohoId,
+        rejectionId: rejectionInsert.insertedId
+      }, 200);
+    });
+  } catch (err) {
+    console.error("❌ Reject Installation Exception:", err.message);
+    return c.json({ error: "Internal server error", details: err.message }, 500);
+  }
+};
+
+
+export const triggerInstallationNotification = async (c) => {
+  try {
+    const {
+      installationId,
+      zohoId,
+      installerNumber,
+      customerMobile,
+      name,
+      scenarioType,
+      eta
+    } = await c.req.json();
+
+    const numericScenario = Number(scenarioType);
+
+    if (![1, 2, 3].includes(numericScenario)) {
+      return c.json(
+        { error: `Invalid scenarioType: ${scenarioType}. Supported scenarios are 1, 2, and 3.` },
+        400
+      );
+    }
+
+    let cleanedCustomerMobile = customerMobile
+      ? String(customerMobile).replace(/\D/g, "")
+      : null;
+
+    if (
+      cleanedCustomerMobile &&
+      cleanedCustomerMobile.length === 12 &&
+      cleanedCustomerMobile.startsWith("91")
+    ) {
+      cleanedCustomerMobile = cleanedCustomerMobile.substring(2);
+    }
+
+    if (!cleanedCustomerMobile || cleanedCustomerMobile.length !== 10) {
+      return c.json({ error: "Invalid or missing customerMobile." }, 400);
+    }
+
+    return await withDatabase(MONGODB_URI, async (db) => {
+      const customerName = name || "Customer";
+
+      // Fallback text content for logging/audit
+      const messages = {
+        1: `Hello ${customerName}, your Kondaas solar installation technician has started their journey to your location. Expected arrival in ${eta || "30"} minutes. You can reach them at ${installerNumber || ""} for any assistance.`,
+        2: `Hello ${customerName}, your Kondaas solar installation technician has arrived at your location.`,
+        3: `Hello ${customerName}, your Kondaas solar installation work has been completed. Thank you for your cooperation! Please rate your experience below.`
+      };
+
+      // Interakt template mappings
+      const interaktTemplates = {
+        1: {
+          templateName: "installer_started",
+          bodyValues: [String(customerName), String(eta || "30"), String(installerNumber || "")]
+        },
+        2: {
+          templateName: "installer_arrived",
+          bodyValues: [String(customerName)]
+        },
+        3: {
+          templateName: "installation_feedback_rating",
+          bodyValues: [String(customerName)]
+        }
+      };
+
+      const selectedTemplate = interaktTemplates[numericScenario];
+
+      const notificationDoc = {
+        from: "Kondaas_System",
+        to: cleanedCustomerMobile,
+        mode: "whatsapp",
+        context: "installation",
+        installationId: installationId || null,
+        zohoId: zohoId ? String(zohoId) : null,
+        customerName,
+        scenarioType: numericScenario,
+        content: new Binary(Buffer.from(messages[numericScenario], "utf8")),
+        contentType: numericScenario === 3 ? "poll" : "text",
+        templateName: selectedTemplate.templateName,
+        bodyValues: selectedTemplate.bodyValues,
+        status: "pending",
+        createdAt: new Date()
+      };
+
+      const result = await db.collection("notifications").insertOne(notificationDoc);
+
+      // Fire-and-forget via existing Interakt worker
+      processWhatsAppNotification(result.insertedId).catch((err) =>
+        console.error("❌ Installation WhatsApp Worker Error:", err)
+      );
+
+      return c.json(
+        {
+          success: true,
+          message: `Installation notification (scenario ${numericScenario}) queued successfully.`,
+          notificationId: result.insertedId,
+          templateName: selectedTemplate.templateName
+        },
+        200
+      );
+    });
+  } catch (err) {
+    console.error("❌ Trigger Installation Notification Exception:", err.message);
+    return c.json({ error: "Internal server error", details: err.message }, 500);
   }
 };
